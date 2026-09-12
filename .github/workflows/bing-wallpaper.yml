@@ -67,7 +67,9 @@ jobs:
           # 旧版遗留的 JPG（本工作流已改为 WebP），一并清理让其从仓库移除
           rm -f paper.jpg
 
-          git add -A wallpapers paper.webp lite.webp paper.jpg
+          git add -A wallpapers paper.webp lite.webp
+          # paper.jpg 可能从未存在过，用 --ignore-unmatch 避免 pathspec 报错
+          git rm -q --ignore-unmatch paper.jpg
           if git diff --cached --quiet; then
             echo "没有需要提交的变更。"
             exit 0
