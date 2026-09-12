@@ -1,0 +1,92 @@
+name: Bing Daily Wallpaper
+
+# 触发方式：
+#   1. 定时：北京时间每天 00:30（UTC 16:30）
+#   2. 手动：Actions 页面点 Run workflow
+#   3. 推送：工作流或脚本自身被修改时，便于改完立即验证
+on:
+  schedule:
+    # 北京时间 00:30 == UTC 前一天 16:30
+    - cron: '30 16 * * *'
+  push:
+    paths:
+      - '.github/workflows/bing-wallpaper.yml'
+      - 'scripts/**'
+  workflow_dispatch:
+
+# 使用内置 GITHUB_TOKEN 推送，无需配置 SSH 部署密钥
+permissions:
+  contents: write
+
+# 避免定时任务与手动触发重叠写入
+concurrency:
+  group: bing-wallpaper
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    name: 抓取并归档当日壁纸
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 安装 WebP 转换工具
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq webp
+          cwebp -version
+
+      - name: 确认时区为北京时间
+        run: |
+          sudo timedatectl set-timezone Asia/Shanghai 2>/dev/null || true
+          echo "当前时间：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S %Z')"
+
+      - name: 抓取壁纸并转为 WebP
+        id: fetch
+        env:
+          # 想调体积/画质改这里；lite 会先缩放到 LITE_WIDTH 宽再压缩
+          WP_QUALITY: '80'
+          LITE_QUALITY: '75'
+          LITE_WIDTH: '1920'
+        run: bash scripts/fetch_bing_wallpaper.sh
+
+      - name: 提交并推送变更
+        if: steps.fetch.outputs.changed == 'true'
+        env:
+          DATE_STR: ${{ steps.fetch.outputs.date }}
+        run: |
+          set -euo pipefail
+          git config --local user.name  "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 旧版遗留的 JPG（本工作流已改为 WebP），一并清理让其从仓库移除
+          rm -f paper.jpg
+
+          git add -A wallpapers paper.webp lite.webp paper.jpg
+          if git diff --cached --quiet; then
+            echo "没有需要提交的变更。"
+            exit 0
+          fi
+
+          git commit -m "chore: 更新必应每日壁纸 ${DATE_STR:0:4}/${DATE_STR:4:2}/${DATE_STR:6:2} (webp)"
+
+          # 远端可能有新提交，rebase 后重试推送
+          for i in 1 2 3; do
+            if git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "推送成功。"
+              exit 0
+            fi
+            echo "第 ${i} 次推送失败，5 秒后重试…"
+            sleep 5
+          done
+          echo "推送失败，请检查仓库权限设置。"
+          exit 1
+
+      - name: 无变更
+        if: steps.fetch.outputs.changed != 'true'
+        run: echo "当日壁纸已是最新，无需提交。"
