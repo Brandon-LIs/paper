@@ -28,8 +28,9 @@ WALLPAPER_DIR="${WALLPAPER_DIR:-wallpapers}"
 PAPER_FILE="${PAPER_FILE:-paper.webp}"
 LITE_FILE="${LITE_FILE:-lite.webp}"
 WP_QUALITY="${WP_QUALITY:-80}"
-LITE_QUALITY="${LITE_QUALITY:-75}"
-LITE_WIDTH="${LITE_WIDTH:-1920}"
+LITE_QUALITY="${LITE_QUALITY:-72}"
+LITE_WIDTH="${LITE_WIDTH:-1280}"
+LITE_MAX_BYTES="${LITE_MAX_BYTES:-200000}"
 
 # 固定北京时间：本项目的「当日」定义即为北京时间当天，不随运行环境漂移
 export TZ="Asia/Shanghai"
@@ -200,13 +201,71 @@ if ! to_webp "$SRC_JPG" "$TMP_PAPER" "$WP_QUALITY" 0; then
   die "paper WebP 转换失败（工具：${CONVERTER}）"
 fi
 
-log "转 WebP：lite（宽度 ${LITE_WIDTH}px, q=${LITE_QUALITY}）"
-if ! to_webp "$SRC_JPG" "$TMP_LITE" "$LITE_QUALITY" "$LITE_WIDTH"; then
+log "转 WebP：lite（宽度 ${LITE_WIDTH}px, q=${LITE_QUALITY}, 上限 $(human "$LITE_MAX_BYTES")）"
+
+# lite 的候选阶梯：(宽度, 质量)，依次尝试，取第一个不超过 LITE_MAX_BYTES 的结果。
+# 降档以「先降宽度」为主、「后降质量」为辅：实测 3840×2160 源图在 1280px 下把质量
+# 从 q72 降到 q50 只省约 19%，而宽度 1280→960 能省约 46%，牺牲分辨率更划算。
+# 不依赖 cwebp 的 -size（目标字节模式实测会超出目标，例如目标 200K 输出 264K）。
+lite_candidates() {
+  local w="$LITE_WIDTH" q="$LITE_QUALITY"
+  if [ "$w" -le 0 ] 2>/dev/null; then
+    printf '%s\n' "0:${q}" "0:$((q - 7))" "0:$((q - 15))"
+    return 0
+  fi
+  printf '%s\n' \
+    "${w}:${q}" \
+    "$((w * 85 / 100)):${q}" \
+    "$((w * 80 / 100)):$((q - 2))" \
+    "$((w * 75 / 100)):$((q - 4))" \
+    "$((w * 62 / 100)):$((q - 7))"
+}
+
+LITE_TRIES=0
+LITE_W_USED="$LITE_WIDTH"
+LITE_Q_USED="$LITE_QUALITY"
+LITE_BYTES=""
+LITE_SCRATCH="${WORK_DIR}/lite.try.webp"
+
+while IFS= read -r CAND; do
+  CAND_W="${CAND%%:*}"
+  CAND_Q="${CAND##*:}"
+  LITE_TRIES=$((LITE_TRIES + 1))
+
+  if ! to_webp "$SRC_JPG" "$LITE_SCRATCH" "$CAND_Q" "$CAND_W"; then
+    warn "lite 编码失败（${CAND_W}px, q=${CAND_Q}），尝试下一档"
+    continue
+  fi
+
+  CAND_BYTES=$(wc -c < "$LITE_SCRATCH")
+  # 记录目前体积最小的一次，保证「全部超标」时也能留下最好的结果
+  if [ -z "$LITE_BYTES" ] || [ "$CAND_BYTES" -lt "$LITE_BYTES" ]; then
+    cp "$LITE_SCRATCH" "$TMP_LITE"
+    LITE_BYTES="$CAND_BYTES"
+    LITE_W_USED="$CAND_W"
+    LITE_Q_USED="$CAND_Q"
+  fi
+
+  if [ "$LITE_MAX_BYTES" -le 0 ] 2>/dev/null || [ "$CAND_BYTES" -le "$LITE_MAX_BYTES" ]; then
+    break
+  fi
+  log "  体积 $(human "$CAND_BYTES") 超出上限，降档重试"
+done < <(lite_candidates)
+
+if [ ! -s "$TMP_LITE" ]; then
   die "lite WebP 转换失败（工具：${CONVERTER}）"
 fi
 
+LITE_FALLBACK="false"
+if [ "$LITE_W_USED" != "$LITE_WIDTH" ] || [ "$LITE_Q_USED" != "$LITE_QUALITY" ]; then
+  LITE_FALLBACK="true"
+fi
+if [ "$LITE_MAX_BYTES" -gt 0 ] 2>/dev/null && [ "$LITE_BYTES" -gt "$LITE_MAX_BYTES" ]; then
+  warn "lite 已降到最低档仍为 $(human "$LITE_BYTES")，超过上限 $(human "$LITE_MAX_BYTES")"
+fi
+log "lite 最终档位：${LITE_W_USED}px q=${LITE_Q_USED}（尝试 ${LITE_TRIES} 次）"
+
 PAPER_BYTES=$(wc -c < "$TMP_PAPER")
-LITE_BYTES=$(wc -c < "$TMP_LITE")
 log "paper.webp = $(human "$PAPER_BYTES")   lite.webp = $(human "$LITE_BYTES")"
 if [ "$LITE_BYTES" -ge "$PAPER_BYTES" ]; then
   warn "lite 体积未小于 paper，请检查 LITE_WIDTH / LITE_QUALITY 设置"
@@ -269,6 +328,9 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
     echo "path=${TARGET_FILE}"
     echo "paper_bytes=${PAPER_BYTES}"
     echo "lite_bytes=${LITE_BYTES}"
+    echo "lite_width=${LITE_W_USED}"
+    echo "lite_quality=${LITE_Q_USED}"
+    echo "lite_fallback=${LITE_FALLBACK}"
     echo "paper_size=$(human "$PAPER_BYTES")"
     echo "lite_size=$(human "$LITE_BYTES")"
     echo "title=${IMG_TITLE}"
