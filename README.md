@@ -29,6 +29,7 @@
 - 图片日期以 Bing 接口返回的 `enddate` 为准，避免运行延迟导致归错档
 - 内容未变化时不产生空提交（MD5 比对）
 - 下载后校验 JPG 魔数（`FF D8 FF`），转换后校验 WebP 容器头（`RIFF....WEBP`）
+- 更新后会**自动刷新 jsDelivr 的 CDN 缓存**，外链不必等缓存过期
 
 ## 目录结构
 
@@ -36,6 +37,7 @@
 .
 ├── .github/workflows/bing-wallpaper.yml   # 定时工作流
 ├── scripts/fetch_bing_wallpaper.sh        # 抓取 + 转 WebP + 归档 + 同步 paper/lite
+├── scripts/purge_jsdelivr.sh              # 刷新 jsDelivr 缓存
 ├── paper.webp                             # 当日最新壁纸（自动生成）
 ├── lite.webp                              # 当日轻量版（自动生成）
 └── wallpapers/
@@ -46,6 +48,45 @@
 ```
 
 > 源 JPG 只在临时目录中转，不会提交进仓库。
+
+## jsDelivr 缓存自动刷新
+
+jsDelivr 对文件有 CDN 缓存（实测响应头为 `s-maxage=43200`，即节点缓存 12 小时；浏览器端 `max-age=604800`，7 天）。不刷新的话，换了图之后外链仍会返回旧图。
+
+工作流的最后一步会依次请求：
+
+```
+https://purge.jsdelivr.net/gh/Brandon-LIs/paper@refs/heads/main/paper.webp
+https://purge.jsdelivr.net/gh/Brandon-LIs/paper@refs/heads/main/lite.webp
+```
+
+**这一步必须排在推送之后** —— jsDelivr 是回源到 GitHub 拉文件的，推送前刷新只会把旧内容重新缓存一遍。因此它的触发条件是 `changed == 'true'`，即确实有新图时才刷新。
+
+成功时接口返回 `throttled: false` 且 `providers` 里列出已刷新的节点（实测为 `CF,FY`，即 Cloudflare 与 Fastly）。
+
+### 关于限流
+
+jsDelivr 对**同一路径**的刷新有频率限制，重复请求会返回：
+
+```json
+{ "status": "finished", "paths": { "...": { "throttled": true, "throttlingReset": 3466 } } }
+```
+
+`throttlingReset` 是剩余秒数（窗口约 1 小时）。这表示该路径**刚被刷新过、缓存本来就是新的**，属于正常情况，脚本只记警告、不会让工作流失败。本工作流每天只跑一次，正常不会遇到；只有手动重复触发时才会出现。
+
+只有网络错误、非 200 响应、或 `status != finished` 才判定为失败（会重试 3 次后报错退出）。
+
+脚本支持手动调用与自定义：
+
+```bash
+# 默认刷新 paper.webp 和 lite.webp
+bash scripts/purge_jsdelivr.sh
+
+# 指定仓库 / 引用 / 文件
+bash scripts/purge_jsdelivr.sh Brandon-LIs/paper refs/heads/main paper.webp
+```
+
+环境变量：`JSDELIVR_UA`（请求 UA）、`PURGE_RETRIES`（重试次数，默认 3）、`PURGE_GRACE`（刷新前等待秒数，默认 5）。
 
 ## 部署步骤
 
@@ -124,6 +165,7 @@ bash scripts/fetch_bing_wallpaper.sh
 2. **新增根目录 `paper.webp` / `lite.webp`**：原项目只归档到 `wallpapers/`，现在额外在根目录维护两个固定文件名，可直接用稳定 URL 引用；`lite.webp` 缩放 + 压缩，适合当作网页背景。
 3. **修复时区问题**：原项目在 UTC 16:30 运行时用 `date +%Y` 取年月，实际拿到的是**前一天**的日期，归档路径会整体偏一天；现在固定 `TZ=Asia/Shanghai`，并以 Bing 的 `enddate` 为权威日期。
 4. **免密钥推送 + 健壮性**：原项目需要配置 SSH 私钥（`SSH_PRIVATE_KEY`），现改用内置 `GITHUB_TOKEN`；同时补齐了图片完整性校验、幂等判断、空提交规避和推送失败重试。
+5. **推送后自动刷新 jsDelivr 缓存**：原项目没有 CDN 环节；本版在推送成功后主动刷新 `paper.webp` / `lite.webp` 的 CDN 缓存，外链无需等待缓存过期。
 
 ## 常见问题
 
@@ -136,7 +178,7 @@ https://raw.githubusercontent.com/<用户名>/<仓库>/main/lite.webp
 
 配合 jsDelivr CDN 会更快：`https://cdn.jsdelivr.net/gh/<用户名>/<仓库>@main/paper.webp`
 
-> 注意 CDN 有缓存，当日更新可能有延迟；`raw.githubusercontent.com` 基本实时但速度取决于网络。
+> CDN 缓存由工作流自动刷新（见上文），当日更新无需等待。`raw.githubusercontent.com` 基本实时但速度取决于网络。
 
 **Q：旧版本留下的 `.jpg` 怎么办？**
 
@@ -148,7 +190,15 @@ WebP 的归档约 2.1 MB/张，一年约 780 MB（比原 JPG 方案省约 1/3）
 
 **Q：想只保留最新一张、不归档历史？**
 
-把工作流里的 `git add -A wallpapers paper.webp lite.webp paper.jpg` 中的 `wallpapers` 去掉即可。
+把工作流提交步骤里的 `git add -A wallpapers paper.webp lite.webp` 中的 `wallpapers` 去掉即可。
+
+**Q：外链还显示旧图？**
+
+先确认工作流运行成功、且「刷新 jsDelivr 缓存」这一步没有报错。若是浏览器本地缓存（`max-age=604800`，7 天），强刷（`Cmd/Ctrl + Shift + R`）即可；CDN 节点缓存已由工作流主动刷新。
+
+**Q：想换个 CDN？**
+
+`scripts/purge_jsdelivr.sh` 里改成对应服务的刷新接口即可，工作流调用方式不变。
 
 ---
 

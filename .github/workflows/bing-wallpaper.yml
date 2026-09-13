@@ -89,6 +89,16 @@ jobs:
           echo "推送失败，请检查仓库权限设置。"
           exit 1
 
+      # 必须在推送成功之后执行：jsDelivr 回源拉的是 GitHub 上的文件，
+      # 提前刷新只会把旧内容重新缓存一遍。仅在确有更新时刷新。
+      - name: 刷新 jsDelivr 缓存
+        if: steps.fetch.outputs.changed == 'true'
+        run: |
+          bash scripts/purge_jsdelivr.sh \
+            "${{ github.repository }}" \
+            "refs/heads/${{ github.ref_name }}" \
+            paper.webp lite.webp
+
       - name: 无变更
         if: steps.fetch.outputs.changed != 'true'
-        run: echo "当日壁纸已是最新，无需提交。"
+        run: echo "当日壁纸已是最新，无需提交，也无需刷新缓存。"
